@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitsnoop"
+version = "1.0.0"
+description = "GitSnoop extracts git author emails with an interactive TUI."
+readme = "README.md"
+authors = [{name = "Elliot", email = "ghub+2aoe06r3@anonaddy.me"}]
+requires-python = ">=3.12"
+dependencies = [
+    "readchar>=4.2.1",
+    "rich>=14.2.0",
+]
+
+[project.scripts]
+gitsnoop = "cli:main"
+
+[tool.setuptools]
+py-modules = [
+    "cli",
+    "clipboard",
+    "config",
+    "exporter",
+    "filters",
+    "git_client",
+    "models",
+    "tui",
+]

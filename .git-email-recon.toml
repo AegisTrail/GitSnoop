@@ -1,0 +1,3 @@
+exclude_github_noreply = false
+sort_mode = "commits"
+compact_help = false
