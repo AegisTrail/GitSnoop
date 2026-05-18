@@ -2,7 +2,7 @@
 ![ascii-art](.media/ascii-art-text.png)
 
                                                                 
-GitSnoop extracts git author emails with an interactive TUI.
+GitSnoop extracts git author emails with a TUI, and optional data breach checks. No API key needed.
 
 
 ## How It Works
@@ -34,8 +34,14 @@ uv tool install git+https://github.com/AegisTrail/GitSnoop.git
 
 ```bash
 > $ gitsnoop --help                                                                                                                                        
-usage: gitsnoop [-h] [-o OUTPUT] [--config CONFIG] [--exclude-github-noreply] [--no-tui] [remote-repo | /absolute/path/to/local/repo]
+usage: gitsnoop [-h] [-o OUTPUT] [--config CONFIG] [--exclude-github-noreply] [--no-tui] [--selected-output SELECTED_OUTPUT] [--skip-breach-checks] [--no-breach-details] [remote-repo | /absolute/path/to/local/repo]
 
+
+ ██████  ██ ████████ ███████ ███    ██  ██████   ██████  ██████
+██       ██    ██    ██      ████   ██ ██    ██ ██    ██ ██   ██
+██   ███ ██    ██    ███████ ██ ██  ██ ██    ██ ██    ██ ██████
+██    ██ ██    ██         ██ ██  ██ ██ ██    ██ ██    ██ ██
+ ██████  ██    ██    ███████ ██   ████  ██████   ██████  ██
 
 GitSnoop extracts git author emails with a stable interactive TUI.
 
@@ -50,25 +56,65 @@ options:
   --exclude-github-noreply
                         Exclude *@users.noreply.github.com addresses from the initial results.
   --no-tui              Run only the CLI export without opening the interactive TUI.
+  --selected-output SELECTED_OUTPUT
+                        Output JSON file for TUI-selected rows. Defaults to <output_dir>/<repo>_selected_emails.json.
+  --skip-breach-checks  Skip breach lookups and omit live breach status in the TUI.
+  --no-breach-details   Do not write breach metadata into exported JSON output.
+  --api                 Run the FastAPI server.
+  --port PORT           Port for the API server when --api is used. Defaults to 6969.
                                                                                          
 ```
 
 If you start gitsnoop with no arguments, it will ask for the repository URL or local path inside the TUI.
 
+## API
+
+GitSnoop also includes an HTTP API.
+
+Start the API server with:
+
+```bash
+gitsnoop --api
+```
+
+By default, the API runs on:
+
+```text
+http://127.0.0.1:6969
+```
+
+Once the server is running, you can open the interactive Swagger API docs here:
+
+```text
+http://127.0.0.1:6969/docs
+```
+
+The OpenAPI JSON is available here:
+
+```text
+http://127.0.0.1:6969/openapi.json
+```
+
+For full API details, request examples, and response format, see [api-docs.md](api-docs.md).
+
 ## Use cases
 
-GitSnoop is an OSINT starter for measuring developer exposure. One email in commit history is often enough. Enough to connect a person to old usernames, public profiles, forgotten accounts, and breach data that never really disappeared.
+GitSnoop helps teams review email exposure in Git history.
 
-That is why this matters in supply chain security. The first move is not always malware. Not always a zero day. Sometimes it is one believable phishing link delivered to the one developer whose history made them easy to identify, profile, and pressure.
+One common case is a developer account breach scenario. A personal or work email in old commits can help an attacker connect that developer to public profiles, old usernames, and breach records. That can lead to targeted phishing, password reset attempts, or social engineering against the person who has access to source code, CI, secrets, or release systems.
 
-And this is the part teams get wrong: cleaning up your setup today does not clean up your history. You can use a dedicated Git email on every new repo and still have old commits telling the real story. If that metadata is still in the graph, assume it can be correlated, enriched, and used as a stepping stone.
+This also matters in supply chain security. The first step is not always malware or an exploit. Sometimes it starts with one exposed email and enough public data to build trust with the target.
+
+GitSnoop is also useful as a service. You can run it with the built-in FastAPI server and let internal tools, dashboards, or automation jobs send scan requests over HTTP instead of using the TUI.
+
+It is also helpful for cleanup work. Teams can use the results to review old commit identity data, spot risky addresses, and decide what should be changed in future Git setup and commit practices.
 
 
 ## Config
 
 GitSnoop stores its config at `~/.config/gitsnoop/config.json`. Customize that `config.json` file according to your liking. On first run, GitSnoop creates it with sensible defaults.
 
-By default, exported JSON files go to `~/.config/gitsnoop/output/`. You can change that by editing `output_dir` in `config.json`, and you can bypass it for a single run with `--output`.
+By default, exported JSON files go to `~/.config/gitsnoop/output/`. You can change that by editing `output_dir` in `config.json`, bypass the main export path for a single run with `--output`, and override the selected-row export path with `--selected-output`. Main and selected exports now include breach status, breach counts, API errors, and per-breach details unless you pass `--no-breach-details`.
 
 ```json
 {
@@ -86,7 +132,9 @@ The interface supports search, sort modes, paging, commit inspection, clipboard 
 - `Up/Down` or `j/k` move selection.
 - `PgUp/PgDn` move by page.
 - `Space` selects or unselects an email.
-- `Enter` shows recent commits for the highlighted author.
+- `Enter` opens breach details for the highlighted author.
+- Inside breach details, `Up/Down` and `PgUp/PgDn` scroll through the full breach list.
+- `h` shows recent commits for the highlighted author.
 - `/` searches by name, email, or domain.
 - `s` cycles sort modes.
 - `c` copies the highlighted email to the clipboard.
