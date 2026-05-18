@@ -4,8 +4,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
+from threading import Lock, Thread
+from time import monotonic, sleep
 
 import readchar
+from breach_models import BreachLookupResult
 from rich import box
 from rich.console import Console, Group, RenderableType
 from rich.layout import Layout
@@ -14,6 +17,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from branding import ascii_banner
 from clipboard import ClipboardError, copy_text
 from exporter import export_selected_records
 from git_client import GitRepositoryClient
@@ -71,11 +75,27 @@ class TUIResult:
 
 
 @dataclass(slots=True)
+class ScanProgressState:
+    repo_source: str
+    message: str = "Waiting to start..."
+    stage: str = "idle"
+    current: int = 0
+    total: int = 0
+    done: bool = False
+    cancelled: bool = False
+    error: Exception | None = None
+    session: object | None = None
+    started_at: float = field(default_factory=monotonic)
+
+
+@dataclass(slots=True)
 class TUIState:
     all_records: list[EmailRecord]
     repo_name: str
     repo_path: Path
     output_dir: Path
+    selected_output_path: Path
+    breach_reports: dict[str, BreachLookupResult] = field(default_factory=dict)
     selected_emails: set[str] = field(default_factory=set)
     index: int = 0
     scroll_offset: int = 0
@@ -85,6 +105,7 @@ class TUIState:
     status_message: str = "Ready"
     status_style: str = "green"
     compact_help: bool = False
+    include_breach_details: bool = True
 
     def filtered_records(self) -> list[EmailRecord]:
         records = list(self.all_records)
@@ -158,7 +179,7 @@ class GitEmailReconTUI:
         layout["body"].update(
             cls._build_prompt_panel(
                 title="Open Repository",
-                prompt="Type a git repository URL or local path. Enter clones it. Esc cancels.",
+                prompt="Type a git repository URL or local path. Enter clones it. Q cancels.",
                 current="",
             )
         )
@@ -177,7 +198,54 @@ class GitEmailReconTUI:
                 layout,
                 live,
                 title="Open Repository",
-                prompt="Type a git repository URL or local path. Enter clones it. Esc cancels.",
+                prompt="Type a git repository URL or local path. Enter clones it. Q cancels.",
+            )
+
+    @classmethod
+    def prompt_for_repo_and_scan(
+        cls,
+        *,
+        scan_service: object,
+        options: object,
+        initial_repo_source: str | None = None,
+    ) -> tuple[str, object] | None:
+        console = Console()
+        layout = Layout()
+        layout.split(
+            Layout(name="header", size=7),
+            Layout(name="body", ratio=1),
+            Layout(name="footer", size=6),
+        )
+        layout["header"].update(cls._render_repo_prompt_header())
+        layout["body"].update(
+            cls._build_prompt_panel(
+                title="Open Repository",
+                prompt="Type a git repository URL or local path. Enter starts the scan. Q cancels.",
+                current="",
+            )
+        )
+        layout["footer"].update(cls._build_input_footer())
+
+        tui = cls.__new__(cls)
+        tui.console = console
+
+        with Live(layout, screen=True, auto_refresh=False, console=console) as live:
+            repo_source = initial_repo_source
+            if repo_source is None:
+                repo_source = tui._prompt_text(
+                    layout,
+                    live,
+                    title="Open Repository",
+                    prompt="Type a git repository URL or local path. Enter starts the scan. Q cancels.",
+                )
+            if not repo_source:
+                return None
+            return tui._run_scan_loading_screen(
+                layout,
+                live,
+                repo_source=repo_source,
+                scan_service=scan_service,
+                options=options,
             )
 
     def __init__(
@@ -187,9 +255,12 @@ class GitEmailReconTUI:
         repo_name: str,
         repo_path: Path,
         output_dir: Path,
+        selected_output_path: Path,
         initial_exclude_github_noreply: bool,
         initial_sort_mode: str,
         compact_help: bool,
+        breach_reports: dict[str, BreachLookupResult],
+        include_breach_details: bool,
     ) -> None:
         self.console = Console()
         self.client = GitRepositoryClient(repo_path)
@@ -198,11 +269,14 @@ class GitEmailReconTUI:
             repo_name=repo_name,
             repo_path=repo_path,
             output_dir=output_dir,
+            selected_output_path=selected_output_path,
+            breach_reports=breach_reports,
             exclude_github_noreply=initial_exclude_github_noreply,
             sort_mode=initial_sort_mode if initial_sort_mode in SORT_MODES else "commits",
             status_message="Use arrows or j/k to navigate",
             status_style="green",
             compact_help=compact_help,
+            include_breach_details=include_breach_details,
         )
 
     def run(self) -> TUIResult:
@@ -217,7 +291,10 @@ class GitEmailReconTUI:
             self._render(layout)
             live.refresh()
             while True:
-                action = self._normalize_key(readchar.readkey())
+                key = readchar.readkey()
+                if key == "Q":
+                    break
+                action = self._normalize_key(key)
 
                 if action == "up":
                     self._move(-1)
@@ -231,6 +308,8 @@ class GitEmailReconTUI:
                     self._toggle_select()
                 elif action == "toggle_noreply":
                     self._toggle_github_noreply_filter()
+                elif action == "view_breaches":
+                    self._show_breach_view(layout, live)
                 elif action == "view_commits":
                     self._show_commit_view(layout, live)
                 elif action == "export_selected":
@@ -395,17 +474,21 @@ class GitEmailReconTUI:
         table.add_column("Name", ratio=2, style="bold white")
         table.add_column("Email", ratio=3, style="white")
         table.add_column("Domain", ratio=2, style="green")
+        table.add_column("isBreached", width=10, justify="center")
         table.add_column("Commits", width=9, justify="right", style="bold white")
         table.add_column("Last Seen", width=10, style="white")
 
         for index, record in enumerate(visible_slice, start=start):
             selected = "[bold green]●[/bold green]" if record.email in self.state.selected_emails else ""
+            breach_result = self.state.breach_reports.get(record.email)
+            breach_marker = "[bold red]■[/bold red]" if breach_result and breach_result.is_breached else ""
             row_style = "bold white on green" if index == self.state.index else ""
             table.add_row(
                 selected,
                 record.name,
                 record.email,
                 record.domain,
+                breach_marker,
                 str(record.commit_count),
                 record.last_seen.isoformat(),
                 style=row_style,
@@ -443,13 +526,14 @@ class GitEmailReconTUI:
                 "[bold cyan]↑/↓[/bold cyan] move   "
                 "[bold cyan]PgUp/PgDn[/bold cyan] page   "
                 "[bold green]space[/bold green] select   "
-                "[bold yellow]enter[/bold yellow] commits   "
+                "[bold yellow]enter[/bold yellow] breaches   "
                 "[bold magenta]/[/bold magenta] search   "
                 "[bold blue]s[/bold blue] sort   "
                 "[bold white]c[/bold white] copy email"
             ),
             Text.from_markup(
                 "[bold magenta]n[/bold magenta] noreply   "
+                "[bold cyan]h[/bold cyan] commits   "
                 "[bold cyan]i[/bold cyan] insights   "
                 "[bold yellow]?[/bold yellow] help   "
                 "[bold blue]g/G[/bold blue] top/bottom   "
@@ -472,7 +556,7 @@ class GitEmailReconTUI:
         mapping = {
             readchar.key.UP: "up",
             readchar.key.DOWN: "down",
-            readchar.key.ENTER: "view_commits",
+            readchar.key.ENTER: "view_breaches",
             page_up: "page_up",
             page_down: "page_down",
             "k": "up",
@@ -483,11 +567,13 @@ class GitEmailReconTUI:
             "/": "search",
             "s": "sort",
             "c": "copy",
+            "h": "view_commits",
             "i": "insights",
             "?": "help",
             "g": "top",
             "G": "bottom",
             "q": "quit",
+            "Q": "quit",
             "\x1b[A": "up",
             "\x1b[B": "down",
             "\x1b[5~": "page_up",
@@ -581,7 +667,7 @@ class GitEmailReconTUI:
             layout,
             live,
             title="Search Authors",
-            prompt="Type a name, email, or domain. Enter applies. Esc cancels.",
+            prompt="Type a name, email, or domain. Enter applies. Q cancels.",
             initial=self.state.search_query,
         )
         if value is None:
@@ -616,7 +702,7 @@ class GitEmailReconTUI:
             key = readchar.readkey()
             if key == readchar.key.ENTER:
                 return "".join(buffer)
-            if key in (readchar.key.ESC, "\x1b"):
+            if key == "Q":
                 return None
             if key in (readchar.key.BACKSPACE, "\x7f"):
                 if buffer:
@@ -625,10 +711,188 @@ class GitEmailReconTUI:
             if len(key) == 1 and key.isprintable():
                 buffer.append(key)
 
+    def _run_scan_loading_screen(
+        self,
+        layout: Layout,
+        live: Live,
+        *,
+        repo_source: str,
+        scan_service: object,
+        options: object,
+    ) -> tuple[str, object]:
+        progress = ScanProgressState(repo_source=repo_source, stage="starting", message="Starting scan...")
+        state_lock = Lock()
+        spinner_frames = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+        def on_progress(stage: str, payload: dict[str, object] | None) -> None:
+            payload = payload or {}
+            with state_lock:
+                progress.stage = stage
+                progress.message = str(payload.get("message", progress.message))
+                progress.current = int(payload.get("current", progress.current) or 0)
+                progress.total = int(payload.get("total", progress.total) or 0)
+
+        def worker() -> None:
+            try:
+                session = scan_service.scan_with_clone(
+                    repo_source,
+                    options=options,
+                    on_progress=on_progress,
+                )
+            except Exception as error:  # pragma: no cover - surfaced to the caller
+                with state_lock:
+                    progress.error = error
+                    progress.done = True
+                return
+
+            with state_lock:
+                progress.session = session
+                progress.done = True
+
+        thread = Thread(target=worker, daemon=True)
+        thread.start()
+        frame = 0
+
+        while True:
+            with state_lock:
+                if progress.error is not None:
+                    raise progress.error
+                if progress.done:
+                    return repo_source, progress.session
+                snapshot = ScanProgressState(
+                    repo_source=progress.repo_source,
+                    message=progress.message,
+                    stage=progress.stage,
+                    current=progress.current,
+                    total=progress.total,
+                    done=progress.done,
+                    cancelled=progress.cancelled,
+                    error=progress.error,
+                    session=progress.session,
+                    started_at=progress.started_at,
+                )
+
+            layout["header"].update(self._render_scan_header(snapshot))
+            layout["body"].update(
+                self._build_loading_panel(
+                    repo_source=repo_source,
+                    progress=snapshot,
+                    spinner=spinner_frames[frame % len(spinner_frames)],
+                )
+            )
+            layout["footer"].update(self._build_loading_footer())
+            live.refresh()
+            frame += 1
+            sleep(0.12)
+
+    @staticmethod
+    def _render_scan_header(progress: ScanProgressState) -> Panel:
+        hero = Table.grid(expand=True)
+        hero.add_column(justify="left", ratio=2)
+        hero.add_column(justify="center", ratio=2)
+        hero.add_column(justify="right", ratio=2)
+        total = progress.total if progress.total else "-"
+        current = progress.current if progress.current else 0
+        hero.add_row(
+            "[bold white]Scanning repository[/bold white]",
+            f"[green]Checked[/green] [bold white]{current}/{total}[/bold white]",
+            "[green]Page[/green] [bold white]0/0[/bold white]",
+        )
+        hero.add_row(
+            "[green]Selected[/green] [bold white]0[/bold white]",
+            f"[green]Stage[/green] [bold white]{GitEmailReconTUI._stage_label(progress.stage)}[/bold white]",
+            "[green]Noreply[/green] [bold white]0[/bold white] [green](shown)[/green]",
+        )
+        hero.add_row(
+            Text.assemble(("Search ", "green"), ("none", "bold white")),
+            "",
+            Text.assemble(("Status ", "green"), (progress.message, "green")),
+        )
+
+        return Panel(
+            hero,
+            title="[bold green]GitSnoop[/bold green]",
+            border_style="green",
+            box=box.HEAVY,
+            style="white on black",
+            padding=(0, 1),
+        )
+
+    @staticmethod
+    def _build_loading_panel(
+        *,
+        repo_source: str,
+        progress: ScanProgressState,
+        spinner: str,
+    ) -> Panel:
+        elapsed = max(0, int(monotonic() - progress.started_at))
+        eta = GitEmailReconTUI._estimate_scan_time(progress)
+        percent = 0
+        if progress.total > 0:
+            percent = min(100, int((progress.current / progress.total) * 100))
+        status_lines: list[RenderableType] = [
+            Text(ascii_banner(), style="bold green"),
+            Text(f"{spinner} Loading repository data...", style="bold white"),
+            Text(f"Repo: {repo_source}", style="white"),
+            Text(f"Elapsed: {elapsed}s", style="green"),
+            Text(f"Estimated time: {eta}", style="green"),
+        ]
+        if progress.total > 0:
+            status_lines.append(
+                Text(f"Progress: {progress.current}/{progress.total} ({percent}%)", style="white")
+            )
+        else:
+            status_lines.append(Text("Progress: starting...", style="white"))
+        return Panel(
+            Group(*status_lines),
+            title="[bold green]Loading[/bold green]",
+            border_style="green",
+            style="white on black",
+            box=box.ROUNDED,
+            padding=(1, 2),
+        )
+
+    @staticmethod
+    def _build_loading_footer() -> Panel:
+        return Panel(
+            Text.from_markup("[green]Please wait[/green]"),
+            title="[bold green]Status[/bold green]",
+            border_style="green",
+            style="white on black",
+            box=box.HEAVY,
+        )
+
+    @staticmethod
+    def _stage_label(stage: str) -> str:
+        labels = {
+            "starting": "Starting",
+            "clone": "Cloning repository",
+            "collect": "Reading commit history",
+            "breach_start": "Checking email breaches",
+            "breach_progress": "Checking email breaches",
+            "breach_skip": "Breach checks skipped",
+            "done": "Finished",
+        }
+        return labels.get(stage, stage.replace("_", " ").title())
+
+    @staticmethod
+    def _estimate_scan_time(progress: ScanProgressState) -> str:
+        if progress.stage == "clone":
+            return "10-60s depending on repo size"
+        if progress.stage in {"collect", "breach_start", "breach_progress"}:
+            if progress.total > 0 and progress.current > 0:
+                elapsed = monotonic() - progress.started_at
+                estimated_total = elapsed * (progress.total / progress.current)
+                remaining = max(1, int(estimated_total - elapsed))
+                return f"about {remaining}s left"
+            return "15-90s depending on email count"
+        return "calculating..."
+
     @staticmethod
     def _build_prompt_panel(*, title: str, prompt: str, current: str) -> Panel:
         return Panel(
             Group(
+                Text(ascii_banner(), style="bold green"),
                 Text(prompt, style="white"),
                 Text.assemble(
                     ("> ", "green"),
@@ -648,13 +912,58 @@ class GitEmailReconTUI:
         return Panel(
             Text.from_markup(
                 "[bold yellow]Enter[/bold yellow] apply   "
-                "[bold red]Esc[/bold red] cancel   "
+                "[bold red]Q[/bold red] cancel   "
                 "[bold cyan]Backspace[/bold cyan] delete"
             ),
             title="[bold green]Input[/bold green]",
             border_style="green",
             style="white on black",
         )
+
+    def _show_breach_view(self, layout: Layout, live: Live) -> None:
+        record = self.state.current_record()
+        if record is None:
+            self.state.status_message = "No record selected"
+            self.state.status_style = "yellow"
+            return
+
+        breach_result = self.state.breach_reports.get(record.email)
+        if breach_result is None:
+            self.state.status_message = f"No breach lookup data for {record.email}"
+            self.state.status_style = "yellow"
+            return
+
+        if breach_result.error:
+            self._render_breach_summary(
+                layout,
+                live,
+                title=f"[bold green]Breach Details for {record.name}[/bold green]",
+                body=Group(
+                    Text(f"Email: {record.email}", style="bold white"),
+                    Text(f"Lookup failed: {breach_result.error}", style="bold red"),
+                ),
+            )
+        elif not breach_result.is_breached:
+            self._render_breach_summary(
+                layout,
+                live,
+                title=f"[bold green]Breach Details for {record.name}[/bold green]",
+                body=Group(
+                    Text(f"Email: {record.email}", style="bold white"),
+                    Text("No breaches found.", style="bold green"),
+                ),
+            )
+        else:
+            self._show_breach_table(layout, live, record.name, record.email, breach_result)
+        if breach_result.error:
+            self.state.status_message = f"Breach lookup failed for {record.email}"
+            self.state.status_style = "red"
+        elif breach_result.is_breached:
+            self.state.status_message = f"Loaded breach details for {record.email}"
+            self.state.status_style = "green"
+        else:
+            self.state.status_message = f"No breaches found for {record.email}"
+            self.state.status_style = "green"
 
     def _show_commit_view(self, layout: Layout, live: Live) -> None:
         record = self.state.current_record()
@@ -741,7 +1050,7 @@ class GitEmailReconTUI:
             visible_max_cursor = max(0, len(visible_commits) - 1)
             cursor = min(cursor, visible_max_cursor)
 
-            if key.lower() == "b" or key in (readchar.key.ESC, "\x1b"):
+            if key.lower() == "b" or key == "Q":
                 break
             if action == "copy":
                 if visible_commits:
@@ -829,7 +1138,7 @@ class GitEmailReconTUI:
         )
         layout["footer"].update(
             Panel(
-                Text.from_markup("[bold yellow]Press b[/bold yellow] to return"),
+                Text.from_markup("[bold yellow]Press b[/bold yellow] or [bold red]Q[/bold red] to return"),
                 border_style="green",
                 style="white on black",
                 title="[bold green]Insights[/bold green]",
@@ -846,7 +1155,8 @@ class GitEmailReconTUI:
             "[bold cyan]↑/↓[/bold cyan] Move one row",
             "[bold cyan]PgUp/PgDn[/bold cyan] Move one page",
             "[bold green]space[/bold green] Select highlighted author",
-            "[bold yellow]enter[/bold yellow] View commit history and author stats",
+            "[bold yellow]enter[/bold yellow] View breach details for the highlighted author",
+            "[bold cyan]h[/bold cyan] Open commit history and author stats",
             "[bold magenta]/[/bold magenta] Search by name, email, or domain",
             "[bold blue]s[/bold blue] Cycle sort mode",
             "[bold white]c[/bold white] Copy highlighted email or commit line to clipboard",
@@ -873,7 +1183,7 @@ class GitEmailReconTUI:
         )
         layout["footer"].update(
             Panel(
-                Text.from_markup("[bold yellow]Press b[/bold yellow] to return"),
+                Text.from_markup("[bold yellow]Press b[/bold yellow] or [bold red]Q[/bold red] to return"),
                 border_style="green",
                 style="white on black",
                 title="[bold green]Help[/bold green]",
@@ -895,8 +1205,14 @@ class GitEmailReconTUI:
             self.state.status_style = "yellow"
             return
 
-        output_path = self.state.output_dir / f"{self.state.repo_name}_selected_emails.json"
-        export_selected_records(output_path, export_records)
+        output_path = self.state.selected_output_path
+        export_selected_records(
+            output_path,
+            repository=self.state.repo_name,
+            records=export_records,
+            breach_reports=self.state.breach_reports,
+            include_breach_details=self.state.include_breach_details,
+        )
         layout["body"].update(
             Panel(
                 Group(
@@ -915,7 +1231,7 @@ class GitEmailReconTUI:
         )
         layout["footer"].update(
             Panel(
-                Text.from_markup("[bold yellow]Press b[/bold yellow] to continue"),
+                Text.from_markup("[bold yellow]Press b[/bold yellow] or [bold red]Q[/bold red] to continue"),
                 border_style="green",
                 style="white on black",
                 title="[bold green]Export[/bold green]",
@@ -927,9 +1243,143 @@ class GitEmailReconTUI:
         self.state.status_message = f"Exported {len(export_records)} selected emails"
         self.state.status_style = "green"
 
+    def _show_breach_table(
+        self,
+        layout: Layout,
+        live: Live,
+        name: str,
+        email: str,
+        breach_result: BreachLookupResult,
+    ) -> None:
+        breaches = breach_result.breaches
+        offset = 0
+        window_size = self._breach_window_size()
+
+        while True:
+            window_size = self._breach_window_size()
+            visible_breaches = breaches[offset : offset + window_size]
+            breach_table = Table(
+                expand=True,
+                show_header=True,
+                header_style="bold green",
+                box=box.SIMPLE_HEAVY,
+                row_styles=["white on black", "white on color(232)"],
+            )
+            breach_table.add_column("Breach", style="bold white", ratio=2, no_wrap=True, overflow="ellipsis")
+            breach_table.add_column("Domain", style="green", ratio=2, no_wrap=True, overflow="ellipsis")
+            breach_table.add_column("Date", width=10, style="white", no_wrap=True)
+            breach_table.add_column("Records", justify="right", style="white", width=12, no_wrap=True)
+            breach_table.add_column("Exposed Data", ratio=4, style="white", no_wrap=True, overflow="ellipsis")
+
+            for breach in visible_breaches:
+                breach_table.add_row(
+                    breach.title,
+                    breach.domain or "-",
+                    breach.breach_date,
+                    f"{breach.pwn_count:,}",
+                    ", ".join(breach.data_classes) or "-",
+                )
+
+            top_indicator = (
+                Text.from_markup("[bold green]▲ more above[/bold green]")
+                if offset > 0
+                else Text(" ", style="white")
+            )
+            bottom_indicator = (
+                Text.from_markup("[bold green]▼ more below[/bold green]")
+                if offset + window_size < len(breaches)
+                else Text(" ", style="white")
+            )
+            summary = Text.from_markup(
+                f"[green]Email[/green] [bold white]{email}[/bold white]   "
+                f"[green]Breaches[/green] [bold white]{len(breaches)}[/bold white]"
+            )
+            stats = Text.from_markup(
+                f"[green]Showing[/green] [bold white]{offset + 1}-{min(len(breaches), offset + window_size)}[/bold white] "
+                f"[green]of[/green] [bold white]{len(breaches)}[/bold white]   "
+                f"[green]Page size[/green] [bold white]{window_size}[/bold white]"
+            )
+
+            layout["body"].update(
+                Panel(
+                    Group(summary, top_indicator, breach_table, bottom_indicator, stats),
+                    title=f"[bold green]Breach Details for {name}[/bold green]",
+                    border_style="green",
+                    style="white on black",
+                    box=box.ROUNDED,
+                    padding=(0, 1),
+                )
+            )
+            layout["footer"].update(
+                Panel(
+                    Text.from_markup(
+                        "[bold cyan]↑/↓[/bold cyan] scroll   "
+                        "[bold cyan]PgUp/PgDn[/bold cyan] page   "
+                        "[bold yellow]b[/bold yellow] return"
+                    ),
+                    border_style="green",
+                    style="white on black",
+                    title="[bold green]Breaches[/bold green]",
+                    box=box.HEAVY,
+                )
+            )
+            live.refresh()
+
+            key = readchar.readkey()
+            action = self._normalize_key(key)
+            max_offset = max(0, len(breaches) - window_size)
+
+            if key.lower() == "b" or key == "Q":
+                return
+            if action == "down" and offset < max_offset:
+                offset += 1
+                continue
+            if action == "up" and offset > 0:
+                offset -= 1
+                continue
+            if action == "page_down" and offset < max_offset:
+                offset = min(max_offset, offset + window_size)
+                continue
+            if action == "page_up" and offset > 0:
+                offset = max(0, offset - window_size)
+                continue
+
+    def _render_breach_summary(
+        self,
+        layout: Layout,
+        live: Live,
+        *,
+        title: str,
+        body: RenderableType,
+    ) -> None:
+        layout["body"].update(
+            Panel(
+                body,
+                title=title,
+                border_style="green",
+                style="white on black",
+                box=box.ROUNDED,
+                padding=(1, 2),
+            )
+        )
+        layout["footer"].update(
+            Panel(
+                Text.from_markup("[bold yellow]Press b[/bold yellow] or [bold red]Q[/bold red] to return"),
+                border_style="green",
+                style="white on black",
+                title="[bold green]Breaches[/bold green]",
+                box=box.HEAVY,
+            )
+        )
+        live.refresh()
+        self._wait_for_back()
+
+    def _breach_window_size(self) -> int:
+        return max(4, self.console.size.height - 18)
+
     def _wait_for_back(self) -> None:
         while True:
             key = readchar.readkey()
             action = self._normalize_key(key)
-            if key.lower() == "b" or action in {"view_commits", "help"} or key in (readchar.key.ESC, "\x1b"):
+            if key.lower() == "b" or key == "Q" or action in {"view_commits", "help"}:
                 return

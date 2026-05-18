@@ -10,8 +10,10 @@ readme = "README.md"
 authors = [{name = "Elliot", email = "ghub+2aoe06r3@anonaddy.me"}]
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115.0",
     "readchar>=4.2.1",
     "rich>=14.2.0",
+    "uvicorn>=0.30.0",
 ]
 
 [project.scripts]
@@ -19,12 +21,20 @@ gitsnoop = "cli:main"
 
 [tool.setuptools]
 py-modules = [
+    "breach_client",
+    "breach_models",
+    "breach_service",
     "cli",
     "clipboard",
     "config",
+    "api_app",
+    "api_models",
+    "api_runner",
+    "branding",
     "exporter",
     "filters",
     "git_client",
     "models",
+    "scan_service",
     "tui",
 ]

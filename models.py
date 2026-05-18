@@ -14,6 +14,7 @@ class EmailRecord:
     commit_count: int
     first_seen: date
     last_seen: date
+    is_breached: bool | None = None
 
     @property
     def is_github_noreply(self) -> bool:
