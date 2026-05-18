@@ -99,15 +99,17 @@ For full API details, request examples, and response format, see [api-docs.md](a
 
 ## Use cases
 
-GitSnoop helps teams review email exposure in Git history.
+From a supply chain attacker point of view, commit history is a starting point for target selection.
 
-One common case is a developer account breach scenario. A personal or work email in old commits can help an attacker connect that developer to public profiles, old usernames, and breach records. That can lead to targeted phishing, password reset attempts, or social engineering against the person who has access to source code, CI, secrets, or release systems.
+An exposed email can be enough to identify which developer is worth following. From there, an attacker can connect that person to public profiles, old usernames, breach records, and other public traces. That makes it easier to build a believable phishing message or a fake support request.
 
-This also matters in supply chain security. The first step is not always malware or an exploit. Sometimes it starts with one exposed email and enough public data to build trust with the target.
+The goal is not always to attack the repository directly. In many cases, the easier path is to reach the person who has access to source code, CI, package publishing, secrets, or release systems.
 
-GitSnoop is also useful as a service. You can run it with the built-in FastAPI server and let internal tools, dashboards, or automation jobs send scan requests over HTTP instead of using the TUI.
+That is where GitSnoop is useful for defenders. It shows what an attacker can learn from commit metadata before any exploit is used.
 
-It is also helpful for cleanup work. Teams can use the results to review old commit identity data, spot risky addresses, and decide what should be changed in future Git setup and commit practices.
+GitSnoop can also run as a service with the built-in FastAPI server. That makes it easier to plug scans into internal tools, dashboards, or automation jobs over HTTP.
+
+Teams can use the results to review old identity exposure, spot risky addresses, and improve future Git setup and commit practices.
 
 
 ## Config
