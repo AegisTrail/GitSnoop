@@ -1,0 +1,243 @@
+openapi: 3.1.0
+info:
+  title: GitSnoop API
+  version: 1.0.0
+  summary: HTTP API for scanning git repositories for author email metadata.
+  description: |
+    GitSnoop exposes the same repository email collection workflow used by the CLI
+    through a FastAPI application.
+servers:
+  - url: http://127.0.0.1:6969
+    description: Local default server
+tags:
+  - name: system
+    description: Service health endpoints
+  - name: scan
+    description: Repository scanning endpoints
+paths:
+  /health:
+    get:
+      tags:
+        - system
+      summary: Health check
+      operationId: health
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                default:
+                  value:
+                    status: ok
+                    service: gitsnoop
+  /scan:
+    post:
+      tags:
+        - scan
+      summary: Scan a repository
+      operationId: scanRepository
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScanRequest"
+            examples:
+              remoteRepository:
+                summary: Scan a remote repository
+                value:
+                  repo: https://github.com/example/project.git
+                  exclude_github_noreply: false
+                  sort_mode: commits
+                  skip_breach_checks: false
+                  include_breach_details: true
+              localRepository:
+                summary: Scan a local repository
+                value:
+                  repo: /absolute/path/to/local/repo
+                  exclude_github_noreply: true
+                  sort_mode: recent
+                  skip_breach_checks: true
+                  include_breach_details: false
+      responses:
+        "200":
+          description: Repository scan completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanResponse"
+              examples:
+                default:
+                  value:
+                    repository: project
+                    repo_source: https://github.com/example/project.git
+                    count: 2
+                    breached_count: 1
+                    results:
+                      - name: Alice Example
+                        email: alice@example.com
+                        domain: example.com
+                        commit_count: 42
+                        first_seen: "2023-01-02"
+                        last_seen: "2026-05-12"
+                        is_breached: true
+                        breach_count: 1
+                        breach_error: null
+                        breaches:
+                          - title: Example Breach
+                            domain: example.com
+                            breach_date: "2024-06-01"
+                            pwn_count: 1000
+                            data_classes:
+                              - Email addresses
+                              - Passwords
+        "400":
+          description: Invalid repository or git command failure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidRepository:
+                  value:
+                    detail: fatal: repository not found
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - service
+      properties:
+        status:
+          type: string
+          example: ok
+        service:
+          type: string
+          example: gitsnoop
+    ScanRequest:
+      type: object
+      required:
+        - repo
+      properties:
+        repo:
+          type: string
+          description: Git repository URL or local filesystem path.
+          example: https://github.com/example/project.git
+        exclude_github_noreply:
+          type: boolean
+          description: Exclude *@users.noreply.github.com addresses from the response.
+          default: false
+        sort_mode:
+          type: string
+          description: Sort order for the returned records.
+          enum:
+            - commits
+            - recent
+            - name
+            - email
+            - domain
+          default: commits
+        skip_breach_checks:
+          type: boolean
+          description: Skip breach lookups and return records without breach status.
+          default: false
+        include_breach_details:
+          type: boolean
+          description: Include breach flags and per-breach metadata in the response.
+          default: true
+    ScanResponse:
+      type: object
+      required:
+        - repository
+        - repo_source
+        - count
+        - breached_count
+        - results
+      properties:
+        repository:
+          type: string
+        repo_source:
+          type: string
+        count:
+          type: integer
+        breached_count:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailRecordResponse"
+    EmailRecordResponse:
+      type: object
+      required:
+        - name
+        - email
+        - domain
+        - commit_count
+        - first_seen
+        - last_seen
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        domain:
+          type: string
+        commit_count:
+          type: integer
+        first_seen:
+          type: string
+          format: date
+        last_seen:
+          type: string
+          format: date
+        is_breached:
+          type:
+            - boolean
+            - "null"
+        breach_count:
+          type:
+            - integer
+            - "null"
+        breach_error:
+          type:
+            - string
+            - "null"
+        breaches:
+          type:
+            - array
+            - "null"
+          items:
+            $ref: "#/components/schemas/BreachEntryResponse"
+    BreachEntryResponse:
+      type: object
+      required:
+        - title
+        - domain
+        - breach_date
+        - pwn_count
+        - data_classes
+      properties:
+        title:
+          type: string
+        domain:
+          type: string
+        breach_date:
+          type: string
+        pwn_count:
+          type: integer
+        data_classes:
+          type: array
+          items:
+            type: string
+    ErrorResponse:
+      type: object
+      required:
+        - detail
+      properties:
+        detail:
+          type: string
